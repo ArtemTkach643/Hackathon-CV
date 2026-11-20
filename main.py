@@ -43,7 +43,8 @@ def find_on_map(photo_gray, sift, matcher, map_points):
 
     # For each photo descriptor take the 2 most similar map descriptors.
     matches = matcher.knnMatch(photo_desc, k=2)
-    good = [m for m, n in matches if m.distance < RATIO * n.distance]
+    # (a descriptor can come back with fewer than 2 candidates, e.g. on a tiny map)
+    good = [p[0] for p in matches if len(p) == 2 and p[0].distance < RATIO * p[1].distance]
     if len(good) < 4:                      # a homography needs at least 4 point pairs
         return None
 
@@ -109,7 +110,7 @@ def main():
     args = parser.parse_args()
 
     out = Path(args.out)
-    out.mkdir(exist_ok=True)
+    out.mkdir(parents=True, exist_ok=True)
 
     map_bgr = cv2.imread(args.map)
     if map_bgr is None:
@@ -117,6 +118,8 @@ def main():
 
     # Photos are named crop_0.png, crop_1.png ... crop_10.png: sort them by the NUMBER,
     # otherwise crop_10 would come before crop_2.
+    if not Path(args.frames).is_dir():
+        raise SystemExit(f"Folder with photos not found: {args.frames}")
     files = [f for f in Path(args.frames).iterdir() if f.suffix.lower() in (".png", ".jpg", ".jpeg")]
     files.sort(key=lambda f: int("".join(ch for ch in f.stem if ch.isdigit()) or 0))
     if not files:
