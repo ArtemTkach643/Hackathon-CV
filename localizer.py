@@ -3,6 +3,9 @@
 Pipeline for one frame:
     SIFT keypoints/descriptors -> FLANN nearest-neighbour matching -> Lowe ratio test
     -> homography with RANSAC -> projected frame corners / centre on the map.
+
+If a frame cannot be matched at the main scale, a few fallback scales are tried
+before the frame is declared lost (multi-scale fallback).
 """
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,10 +17,12 @@ import numpy as np
 @dataclass
 class Localization:
     """Result of locating one frame on the map (all coordinates are map pixels)."""
-    H: np.ndarray          # 3x3 homography: frame -> map
+    H: np.ndarray          # 3x3 homography: (resized) frame -> map
     corners: np.ndarray    # (4, 2) frame corners projected on the map (TL, TR, BR, BL)
     center: np.ndarray     # (2,) frame centre projected on the map
     inliers: int           # number of RANSAC inliers (confidence of the match)
+    reproj_err: float      # median reprojection error of the inliers, map pixels
+    scale: float           # frame scale at which the match succeeded
 
 
 class MapLocalizer:
@@ -39,24 +44,46 @@ class MapLocalizer:
         self.matcher.add([self.map_desc])
         self.matcher.train()
 
+    @staticmethod
+    def _fingerprint(gray):
+        """Cheap map signature, so a cache built for another map is never reused."""
+        small = cv2.resize(gray, (64, 64), interpolation=cv2.INTER_AREA)
+        return np.array([*gray.shape, int(small.astype(np.int64).sum())], dtype=np.int64)
+
     def _map_features(self, gray, cache_path):
+        fp = self._fingerprint(gray)
         if cache_path and Path(cache_path).exists():
             data = np.load(cache_path)
-            return data["pts"], data["desc"]
+            if "fp" in data and np.array_equal(data["fp"], fp):
+                return data["pts"], data["desc"]
+            print("Map changed since the cache was built - recomputing map features")
         kps, desc = self.sift.detectAndCompute(gray, None)
+        if desc is None:
+            raise ValueError("No SIFT features found on the map")
         pts = np.float32([k.pt for k in kps])
         if cache_path:
-            np.savez(cache_path, pts=pts, desc=desc)
+            np.savez(cache_path, pts=pts, desc=desc, fp=fp)
         return pts, desc
 
-    def locate(self, frame_bgr, scale=1.0):
-        """Return Localization or None if the frame could not be matched reliably.
+    def locate(self, frame_bgr, scale=0.5, fallback_scales=(1.0, 0.25)):
+        """Return the Localization of a frame, or None if it could not be matched reliably.
+
+        The main `scale` is tried first; if it fails, the `fallback_scales` are tried in order.
+        """
+        for s in (scale, *[f for f in fallback_scales if f != scale]):
+            res = self._locate_at(frame_bgr, s)
+            if res is not None:
+                return res
+        return None
+
+    def _locate_at(self, frame_bgr, scale):
+        """One matching attempt at a fixed frame scale.
 
         `scale` resizes the frame before SIFT. Frames are ~4x "zoomed in" compared
         to the map, so shrinking them can bring features closer to the map's scale.
         Result coordinates are still in map pixels (the homography absorbs the scale).
         """
-        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+        gray = frame_bgr if frame_bgr.ndim == 2 else cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
         if scale != 1.0:
             gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
 
@@ -79,9 +106,14 @@ class MapLocalizer:
         H, mask = cv2.findHomography(src, dst, cv2.RANSAC, self.ransac_thresh)
         if H is None:
             return None
-        inliers = int(mask.sum())
+        inl = mask.ravel().astype(bool)
+        inliers = int(inl.sum())
         if inliers < self.min_inliers:
             return None
+
+        # How well the inliers fit the homography (lower = more precise localisation).
+        proj = cv2.perspectiveTransform(src[inl], H)
+        reproj_err = float(np.median(np.linalg.norm(proj - dst[inl], axis=2)))
 
         h, w = gray.shape
         corners = cv2.perspectiveTransform(
@@ -91,7 +123,8 @@ class MapLocalizer:
 
         # Sanity check: the projected frame must be a proper convex quadrilateral,
         # otherwise the homography is degenerate (a "bow-tie" = wrong match).
-        if not cv2.isContourConvex(np.int32(corners).reshape(-1, 1, 2)):
+        if not cv2.isContourConvex(np.int32(np.round(corners)).reshape(-1, 1, 2)):
             return None
 
-        return Localization(H=H, corners=corners, center=center, inliers=inliers)
+        return Localization(H=H, corners=corners, center=center, inliers=inliers,
+                            reproj_err=reproj_err, scale=scale)
