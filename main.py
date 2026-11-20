@@ -1,81 +1,197 @@
-"""Reconstruct a UAV route on a satellite map from a series of frames.
+"""Reconstruct the route of a UAV on a satellite map.
 
-Usage:
+Idea: for every UAV photo we find where it lies on the big map, take the centre of
+that place as one point of the route, and finally draw all the points on the map.
+
+How one photo is placed on the map:
+    1. SIFT finds "interesting points" (corners, crossroads...) on the photo and on the map.
+    2. Points are matched by their descriptors (a description of the surroundings).
+    3. RANSAC (inside findHomography) throws away wrong matches and gives a matrix H
+       that converts photo coordinates to map coordinates.
+    4. With H we convert the photo centre and its corners to the map.
+
+Run:
     python main.py --map data/global_map.png --frames data/crops --out results
 """
 import argparse
-import re
 from pathlib import Path
 
 import cv2
 import numpy as np
 
-from localizer import MapLocalizer
-from trajectory import interpolate_missing, reject_outliers, smooth
-from visualize import draw_route, make_video
+SCALE = 0.5        # shrink photos before SIFT: they are zoomed in ~4x compared to the map
+RATIO = 0.75       # ratio test: a match is kept only if it is clearly better than the 2nd best
+MIN_INLIERS = 15   # fewer RANSAC "agreeing" matches than this -> we do not trust the result
+MAX_JUMP = 4       # a point this many "typical steps" away from its neighbours is a wrong match
 
 
-def natural_key(path):
-    """Sort crop_2.png before crop_10.png (plain string sort would not)."""
-    return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", path.name)]
+def find_features(gray, sift):
+    """Return coordinates of the keypoints (N x 2) and their descriptors (N x 128)."""
+    keypoints, descriptors = sift.detectAndCompute(gray, None)
+    points = np.float32([k.pt for k in keypoints])
+    return points, descriptors
 
 
-def parse_args():
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--map", default="data/global_map.png", help="path to the satellite map")
-    p.add_argument("--frames", default="data/crops", help="directory with UAV frames")
-    p.add_argument("--out", default="results", help="output directory")
-    p.add_argument("--scale", type=float, default=0.5, help="frame downscale factor before SIFT")
-    p.add_argument("--ratio", type=float, default=0.75, help="Lowe ratio test threshold")
-    p.add_argument("--min-inliers", type=int, default=15, help="min RANSAC inliers to accept a frame")
-    p.add_argument("--smooth", type=int, default=1, help="moving-average window (1 = off)")
-    p.add_argument("--video", action="store_true", help="also write route.mp4")
-    return p.parse_args()
+def find_on_map(photo_gray, sift, matcher, map_points):
+    """Find the place of one photo on the map.
+
+    Returns (centre, corners, inliers) in map pixels, or None if the photo was not found.
+    """
+    photo = cv2.resize(photo_gray, None, fx=SCALE, fy=SCALE, interpolation=cv2.INTER_AREA)
+    photo_points, photo_desc = find_features(photo, sift)
+    if photo_desc is None or len(photo_desc) < 2:
+        return None
+
+    # For each photo descriptor take the 2 most similar map descriptors.
+    matches = matcher.knnMatch(photo_desc, k=2)
+    # (a descriptor can come back with fewer than 2 candidates, e.g. on a tiny map)
+    good = [p[0] for p in matches if len(p) == 2 and p[0].distance < RATIO * p[1].distance]
+    if len(good) < 4:                      # a homography needs at least 4 point pairs
+        return None
+
+    src = np.float32([photo_points[m.queryIdx] for m in good]).reshape(-1, 1, 2)
+    dst = np.float32([map_points[m.trainIdx] for m in good]).reshape(-1, 1, 2)
+    H, mask = cv2.findHomography(src, dst, cv2.RANSAC, 5.0)
+    if H is None or mask.sum() < MIN_INLIERS:
+        return None
+
+    h, w = photo.shape
+    corners = np.float32([[0, 0], [w, 0], [w, h], [0, h]]).reshape(-1, 1, 2)
+    corners_on_map = cv2.perspectiveTransform(corners, H).reshape(-1, 2)
+    centre = cv2.perspectiveTransform(np.float32([[[w / 2, h / 2]]]), H)[0, 0]
+    # A real photo stays a convex quadrilateral on the map; a twisted one means a broken H.
+    if not cv2.isContourConvex(np.int32(np.round(corners_on_map)).reshape(-1, 1, 2)):
+        return None
+    return centre, corners_on_map, int(mask.sum())
+
+
+def drop_jumps(centres, boxes):
+    """Remove photos that were matched to a wrong place of the map.
+
+    Such a match can be very confident (hundreds of inliers), but the drone cannot jump:
+    compare every point with the median of its 4+4 found neighbours and drop it if it is
+    farther than MAX_JUMP steps of the drone there (median step between those neighbours).
+    Medians ignore a few bad neighbours, so even several wrong photos in a row are caught.
+    The limit is never smaller than one photo, so a hovering drone is not "jumping".
+    Returns the indices of the dropped photos.
+    """
+    found = [i for i, c in enumerate(centres) if c is not None]
+    if len(found) < 5:
+        return []
+    pts = np.array([centres[i] for i in found])
+    photo_size = np.median([np.linalg.norm(boxes[i][1] - boxes[i][0]) for i in found])
+    dropped = []
+    for k, i in enumerate(found):
+        lo = max(0, k - 4)
+        neighbours = np.delete(pts[lo:k + 5], k - lo, axis=0)
+        step = np.median(np.linalg.norm(np.diff(neighbours, axis=0), axis=1))
+        if np.linalg.norm(pts[k] - np.median(neighbours, axis=0)) > max(MAX_JUMP * step, photo_size):
+            dropped.append(i)
+    for i in dropped:
+        centres[i] = None
+    return dropped
+
+
+def fill_gaps(centres):
+    """Photos that were not found (None) get a point on the straight line between neighbours."""
+    found = [i for i, c in enumerate(centres) if c is not None]
+    x = np.interp(range(len(centres)), found, [centres[i][0] for i in found])
+    y = np.interp(range(len(centres)), found, [centres[i][1] for i in found])
+    return np.stack([x, y], axis=1)
+
+
+def draw_route(map_bgr, path, boxes, was_found, out_path):
+    """Draw the route on the map and save the part of the map around it."""
+    img = map_bgr.copy()
+    points = np.int32(np.round(path))
+
+    for i, box in enumerate(boxes):                # footprint of every 5th photo + the last one
+        if box is not None and (i % 5 == 0 or i == len(boxes) - 1):
+            cv2.polylines(img, [np.int32(box)], True, (255, 200, 0), 3, cv2.LINE_AA)
+
+    cv2.polylines(img, [points.reshape(-1, 1, 2)], False, (0, 220, 255), 4, cv2.LINE_AA)
+
+    for i, (x, y) in enumerate(points):
+        colour = (0, 0, 255) if was_found[i] else (0, 140, 255)   # orange = interpolated
+        cv2.circle(img, (x, y), 7, colour, -1, cv2.LINE_AA)
+        if i % 2 == 0:                                            # number of the point
+            cv2.putText(img, str(i), (x + 9, y - 9), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7, (255, 255, 255), 2, cv2.LINE_AA)
+
+    start, finish = points[0], points[-1]
+    cv2.circle(img, tuple(int(v) for v in start), 16, (0, 200, 0), -1, cv2.LINE_AA)
+    cv2.circle(img, tuple(int(v) for v in finish), 16, (0, 0, 0), -1, cv2.LINE_AA)
+    cv2.putText(img, "START", (start[0] + 22, start[1] + 8), cv2.FONT_HERSHEY_SIMPLEX,
+                1.1, (255, 255, 255), 3, cv2.LINE_AA)
+    cv2.putText(img, "FINISH", (finish[0] + 22, finish[1] + 8), cv2.FONT_HERSHEY_SIMPLEX,
+                1.1, (255, 255, 255), 3, cv2.LINE_AA)
+
+    # Cut the map to the area of the route (+ a margin) so the details are visible.
+    everything = np.vstack([points] + [np.int32(b) for b in boxes if b is not None])
+    x0, y0 = np.maximum(everything.min(axis=0) - 250, 0)
+    x1, y1 = everything.max(axis=0) + 250
+    cv2.imwrite(str(out_path), img[y0:y1, x0:x1])
 
 
 def main():
-    args = parse_args()
+    parser = argparse.ArgumentParser(description="Reconstruct a UAV route on a satellite map")
+    parser.add_argument("--map", default="data/global_map.png", help="satellite map")
+    parser.add_argument("--frames", default="data/crops", help="folder with UAV photos")
+    parser.add_argument("--out", default="results", help="folder for the results")
+    args = parser.parse_args()
+
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
 
     map_bgr = cv2.imread(args.map)
     if map_bgr is None:
-        raise SystemExit(f"Cannot read map: {args.map}")
+        raise SystemExit(f"Cannot read the map: {args.map}")
 
-    frame_files = sorted(Path(args.frames).glob("*.png"), key=natural_key)
-    if not frame_files:
-        raise SystemExit(f"No .png frames in {args.frames}")
+    # Photos are named crop_0.png, crop_1.png ... crop_10.png: sort them by the NUMBER,
+    # otherwise crop_10 would come before crop_2.
+    if not Path(args.frames).is_dir():
+        raise SystemExit(f"Folder with photos not found: {args.frames}")
+    files = [f for f in Path(args.frames).iterdir() if f.suffix.lower() in (".png", ".jpg", ".jpeg")]
+    files.sort(key=lambda f: int("".join(ch for ch in f.stem if ch.isdigit()) or 0))
+    if not files:
+        raise SystemExit(f"No photos in {args.frames}")
 
-    loc = MapLocalizer(map_bgr, cache_path=out / "map_features.npz",
-                       ratio=args.ratio, min_inliers=args.min_inliers)
+    # Features of the map are found once; FLANN is a fast search of similar descriptors.
+    sift = cv2.SIFT_create()
+    map_points, map_desc = find_features(cv2.cvtColor(map_bgr, cv2.COLOR_BGR2GRAY), sift)
+    matcher = cv2.FlannBasedMatcher(dict(algorithm=1, trees=5), dict(checks=50))
+    matcher.add([map_desc])
+    matcher.train()
 
-    centers, boxes = [], []
-    for i, f in enumerate(frame_files):
-        res = loc.locate(cv2.imread(str(f)), scale=args.scale)
-        if res is None:
-            print(f"[{i:2d}] {f.name}: FAILED")
-            centers.append(None)
+    centres, boxes = [], []
+    for i, f in enumerate(files):
+        photo_gray = cv2.imread(str(f), cv2.IMREAD_GRAYSCALE)
+        result = None if photo_gray is None else find_on_map(photo_gray, sift, matcher, map_points)
+        if result is None:
+            print(f"[{i:2d}] {f.name}: NOT FOUND")
+            centres.append(None)
             boxes.append(None)
         else:
-            print(f"[{i:2d}] {f.name}: inliers={res.inliers:4d} centre=({res.center[0]:.0f}, {res.center[1]:.0f})")
-            centers.append(res.center)
-            boxes.append(res.corners)
+            centre, corners, inliers = result
+            print(f"[{i:2d}] {f.name}: inliers={inliers:3d} centre=({centre[0]:.0f}, {centre[1]:.0f})")
+            centres.append(centre)
+            boxes.append(corners)
 
-    # Remove implausible jumps, then fill the gaps and (optionally) smooth.
-    cleaned = reject_outliers(centers)
-    for i, (a, b) in enumerate(zip(centers, cleaned)):
-        if a is not None and b is None:
-            print(f"[{i:2d}] rejected as outlier")
-            boxes[i] = None
-    path, measured = interpolate_missing(cleaned)
-    path = smooth(path, args.smooth)
+    for i in drop_jumps(centres, boxes):
+        print(f"[{i:2d}] {files[i].name}: dropped - jumps away from the route (wrong place)")
+        boxes[i] = None
 
-    print(f"Matched {measured.sum()}/{len(frame_files)} frames")
+    found_count = sum(c is not None for c in centres)
+    print(f"Found {found_count} of {len(files)} photos (the rest are interpolated)")
+    if found_count < 2:
+        raise SystemExit("Too few photos were found to build a route")
+
+    path = fill_gaps(centres)
+    was_found = [c is not None for c in centres]
+
     np.savetxt(out / "trajectory.csv", path, delimiter=",", header="x,y", comments="", fmt="%.1f")
-    draw_route(map_bgr, path, measured, boxes, out / "route.png")
-    if args.video:
-        make_video(map_bgr, path, boxes, out / "route.mp4")
-    print(f"Saved results to {out.resolve()}")
+    draw_route(map_bgr, path, boxes, was_found, out / "route.png")
+    print(f"Results saved to {out.resolve()}")
 
 
 if __name__ == "__main__":

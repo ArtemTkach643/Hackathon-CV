@@ -1,50 +1,76 @@
 # UAV route reconstruction from satellite imagery (classic CV)
 
-Given a large satellite map and 50 consecutive "photos" from a UAV (satellite crops taken
-at another scale and rotation), the program finds where each photo was taken on the map and
+Given a large satellite map and 50 consecutive "photos" from a UAV (satellite crops taken at
+another scale and rotation), the program finds where each photo was taken on the map and
 draws the resulting route.
 
-![route](results/route.png)
+![route](results/route_preview.jpg)
 
-## Approach
+## How it works
 
-Every frame is localised **independently on the global map** (not frame-to-frame), so errors
-do not accumulate over the flight.
+Every photo is placed **directly on the big map** (not relative to the previous photo), so
+errors do not pile up along the flight.
 
-1. **Features** - SIFT keypoints and 128-d descriptors on the grayscale map (computed once
-   and cached in `results/map_features.npz`) and on each frame. SIFT is invariant to scale
-   and rotation, which is exactly the difference between the frames and the map.
-2. **Matching** - FLANN (KD-tree) finds the 2 nearest map descriptors for every frame descriptor;
-   Lowe's ratio test (`best < 0.75 * second best`) keeps only unambiguous matches.
-3. **Geometry** - `cv2.findHomography` with RANSAC (5 px threshold) estimates the frame -> map
-   homography and rejects remaining wrong matches. Ground is almost planar, so a homography
-   describes the view change well.
-4. **Projection** - the frame centre gives a route point; the four projected corners give the
-   footprint (size and rotation preserved).
-5. **Validation** - a frame is accepted only with >= 15 RANSAC inliers and a convex projected
-   footprint.
-6. **Post-processing** (`trajectory.py`) - jump outliers are removed, gaps are linearly
-   interpolated (shown as hollow points), optional moving-average smoothing (`--smooth`).
-   In this dataset none of them were needed: all frames matched and no outliers were found.
+1. **SIFT** finds keypoints (corners, crossroads, roof edges) on the map and on the photo.
+   Each keypoint gets a descriptor - 128 numbers describing its surroundings. SIFT works even
+   if the photo is rotated or has another scale, which is exactly our case.
+2. **Matching** - for each photo descriptor we look for the two most similar map descriptors
+   (FLANN, a fast approximate search). The *ratio test* keeps a match only if the best
+   candidate is clearly better than the second one (`0.75`), otherwise it is ambiguous.
+3. **Homography + RANSAC** - `cv2.findHomography` finds a 3x3 matrix that converts photo
+   coordinates to map coordinates. RANSAC ignores wrong matches and keeps the biggest
+   consistent group; the photo is accepted if at least 15 matches agree (*inliers*).
+4. **Route point** - the photo centre converted with this matrix is one point of the route;
+   the four converted corners give the footprint of the photo (size and rotation are kept).
+5. **Wrong places** - a photo can be matched to a *wrong* place of the map with hundreds of
+   inliers (a repeated pattern, a broken photo), so the inlier count cannot catch it. But the
+   drone cannot jump: every point is compared with the median of its 4+4 neighbours and is
+   dropped if it is farther than 4 local steps (and at least one photo size, so a hovering
+   drone is fine). Medians ignore a few bad neighbours, so several wrong photos in a row are
+   caught too.
+6. **Missing photos** - if a photo is not found or dropped, its point is placed on the straight
+   line between the neighbouring found photos (drawn in orange).
 
 ## Results
 
-* 50 / 50 frames localised, 112-359 RANSAC inliers per frame (mean ~260).
-* The route is smooth (step between frames ~64 px) from frame 0 (START) to frame 49 (FINISH).
-* `results/verification.png` - sanity check: frame (left) vs. the map warped into the frame's
+* 50 / 50 photos found, 109-359 inliers per photo (mean ~260).
+* The route is smooth from photo 0 (START) to photo 49 (FINISH).
+* `results/verification.png` - sanity check: photo (left) vs. the map warped into the photo's
   view (right); buildings, bridges and rails coincide.
 
-### Downscaling experiment (frame scale before SIFT)
+### Comparison of the versions (synthetic flights with known truth)
 
-| scale | frames matched | mean inliers | min inliers | time (50 frames) |
-|-------|----------------|--------------|-------------|------------------|
-| 1.0   | 50/50          | 261          | 112         | 22 s             |
-| 0.5   | 50/50          | 263          | 109         | 6 s              |
-| 0.35  | 50/50          | 261          | 108         | 3 s              |
-| 0.25  | 50/50          | 256          | 108         | 2 s              |
+The task has no true coordinates, so all branches were run on 9 synthetic 50-photo flights cut
+from the map at known places: clean, degraded (lighting/blur/noise/clouds/colour + tilt), all
+degradations at once, broken photos, **wrong places in a row**, altitude 90-520 px,
+**hovering drone**, sharp zigzag turns, every 2nd photo unusable. "Bad points" = route points
+more than 22 px (10 % of a photo) from the truth.
 
-Quality is practically unchanged down to 0.25 while speed improves ~10x, so the default is
-`--scale 0.5` (a safe middle ground). Time excludes the one-off map feature extraction.
+| version | bad points (9 flights, 450 points) | where it fails | median error | time / flight |
+|---------|-----------------------------------|----------------|--------------|---------------|
+| `main` (modular) | 20 | wrong places in a row (5), hovering (14), 1* | 0.35 px | ~10 s |
+| `simplify` (PR #2) | 11 | any wrong place (2 + 5), every-2nd-lost (4) | 0.35 px | ~10 s |
+| `benchmark-and-pitch` (PR #1) | 20 | same as `main` | 0.35 px | ~10 s |
+| **`simple-robust` (this)** | **1*** | - | 0.35 px | ~10 s |
+
+\* the last photo of the "every 2nd unusable" flight is noise, so every version ends the route
+at the previous photo (one step, 65 px) - nothing to fix there.
+
+Accuracy and speed are the same everywhere (same SIFT + RANSAC core); the versions differ only
+in how they treat bad photos. The map-features cache of the modular versions saves ~3 s per run
+and the multi-scale fallback did not change any route, so this version keeps neither.
+
+### Downscaling experiment (photo scale before SIFT)
+
+| scale | photos found | mean inliers | min inliers | time (50 photos) |
+|-------|--------------|--------------|-------------|------------------|
+| 1.0   | 50/50        | 261          | 112         | 22 s             |
+| 0.5   | 50/50        | 263          | 109         | 6 s              |
+| 0.35  | 50/50        | 261          | 108         | 3 s              |
+| 0.25  | 50/50        | 256          | 108         | 2 s              |
+
+The quality is practically the same, but smaller photos are much faster, so `SCALE = 0.5`
+(constant at the top of `main.py`).
 
 ## Usage
 
@@ -54,29 +80,43 @@ python -m venv .venv
 pip install -r requirements.txt
 
 python main.py --map data/global_map.png --frames data/crops --out results
-python main.py --video          # additionally writes results/route.mp4
+python selftest.py --map data/global_map.png      # unit + end-to-end test with known truth
 ```
 
-Options: `--scale`, `--ratio`, `--min-inliers`, `--smooth`, `--video` (see `python main.py -h`).
+The task data goes into `data/` (it is not stored in the repository). Output in `results/`:
+`route.png` (map with the route, numbered points, START/FINISH, footprint of every 5th photo)
+and `trajectory.csv` (route points in map pixels). The run takes about 12 seconds.
 
-Outputs in `results/`: `route.png` (map with route, numbered points, START/FINISH and every
-5th frame footprint), `trajectory.csv` (route in map pixels), `route.mp4` (optional),
-`map_features.npz` (cache; safe to delete).
-
-## Project layout
+## Files
 
 | File | Purpose |
 |------|---------|
-| `main.py` | CLI, runs the pipeline over all frames |
-| `localizer.py` | SIFT + FLANN + ratio test + RANSAC homography for one frame |
-| `trajectory.py` | outlier rejection, gap interpolation, smoothing |
-| `visualize.py` | route image and video |
-| `explore_single.py` | step-by-step prototype for a single frame |
+| `main.py` | the whole solution (about 190 lines, every function is commented) |
+| `selftest.py` | tests with known truth: `drop_jumps` cases + a synthetic flight with broken photos |
+| `explore_single.py` | step-by-step prototype for a single photo |
+| `pitch/` | pitch slides (EN and UA) |
+
+## Other versions of the code (git branches)
+
+This version is the simple one-file solution plus the one step that measurably matters
+(dropping wrong places). The other versions are kept in branches:
+
+* `main` - the first version split into modules (`localizer.py`, `trajectory.py`,
+  `visualize.py`) with a map-features cache, outlier rejection, smoothing and a route video.
+* `benchmark-and-pitch` (pull request #1) - on top of that: accuracy benchmark on synthetic
+  frames with known ground truth (`benchmark.py`), multi-scale fallback, per-frame CSV report,
+  `--verify`. **The single-photo numbers in `pitch/`** ("0 wrong answers in 540 tests") come from
+  its `benchmark.py`; the localisation core is the same in all versions.
+* `simplify` (pull request #2) - the one-file version without any check of wrong places.
 
 ## Limitations
 
-* Frame order is taken from the file numbering (`crop_0` ... `crop_49`).
-* Matching relies on the frames and the map being the same kind of imagery (here: crops of the
-  same map). Real UAV photos with other lighting/season would need a stronger matcher
-  (e.g. SuperPoint + LightGlue or LoFTR).
-* Accuracy was checked visually; no ground-truth coordinates were available.
+* Photo order is taken from the file numbers (`crop_0` ... `crop_49`).
+* A photo that is not found or dropped is replaced by a point on the straight line between its
+  neighbours (on a curve this can be a few px off); if the last photo is lost, the route ends at
+  the previous one.
+* If more than ~4 of 9 photos in a row show the same wrong place, they cannot be told apart from
+  the real route.
+* Works because photos and map are the same kind of imagery. Real UAV photos with another
+  season or lighting would need a stronger matcher (SuperPoint + LightGlue, LoFTR).
+* Coordinates are in map pixels; GPS would need the georeference of the map.
