@@ -1,0 +1,19 @@
+condition,config,n,correct,wrong,lost,median_err,p95_err,ms
+clean,baseline (scale 0.5),60,60,0,0,0.35,0.36,106.63
+clean,+ multi-scale fallback,60,60,0,0,0.35,0.36,102.29
+lighting,baseline (scale 0.5),60,60,0,0,0.35,0.37,103.93
+lighting,+ multi-scale fallback,60,60,0,0,0.35,0.37,101.91
+blur,baseline (scale 0.5),60,60,0,0,0.35,0.41,52.82
+blur,+ multi-scale fallback,60,60,0,0,0.35,0.41,57.89
+noise,baseline (scale 0.5),60,60,0,0,0.36,0.37,98.71
+noise,+ multi-scale fallback,60,60,0,0,0.36,0.37,111.43
+clouds,baseline (scale 0.5),60,60,0,0,0.35,0.37,80.05
+clouds,+ multi-scale fallback,60,60,0,0,0.35,0.37,78.58
+season,baseline (scale 0.5),60,60,0,0,0.35,0.37,68.20
+season,+ multi-scale fallback,60,60,0,0,0.35,0.37,73.90
+all-combined,baseline (scale 0.5),60,58,0,2,0.36,0.47,30.69
+all-combined,+ multi-scale fallback,60,59,0,1,0.36,0.48,32.94
+low-altitude,baseline (scale 0.5),60,60,0,0,0.36,0.38,35.21
+low-altitude,+ multi-scale fallback,60,60,0,0,0.36,0.38,36.85
+high-altitude,baseline (scale 0.5),60,60,0,0,0.35,0.37,126.37
+high-altitude,+ multi-scale fallback,60,60,0,0,0.35,0.37,122.11

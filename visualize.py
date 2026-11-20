@@ -1,4 +1,6 @@
 """Drawing of the reconstructed route on the map (image and optional video)."""
+from pathlib import Path
+
 import cv2
 import numpy as np
 
@@ -9,7 +11,8 @@ def _draw_frame_box(img, corners, color, thickness):
     cv2.polylines(img, [np.int32(corners).reshape(-1, 1, 2)], True, color, thickness, cv2.LINE_AA)
 
 
-def draw_route(map_bgr, path, measured, boxes, out_path, margin=250, label_every=2, box_every=5):
+def draw_route(map_bgr, path, measured, boxes, out_path, margin=250, label_every=2, box_every=5,
+               preview_width=1600):
     """Save an image with the route, numbered points, start/finish and frame footprints.
 
     path     : (N, 2) route points in map pixels (after interpolation/smoothing)
@@ -49,8 +52,45 @@ def draw_route(map_bgr, path, measured, boxes, out_path, margin=250, label_every
     allpts = np.vstack([pts] + [np.int32(b) for b in boxes if b is not None])
     x0, y0 = np.maximum(allpts.min(0) - margin, 0)
     x1, y1 = allpts.max(0) + margin
-    cv2.imwrite(str(out_path), img[y0:y1, x0:x1])
+    crop = img[y0:y1, x0:x1]
+    cv2.imwrite(str(out_path), crop)
+    # Light-weight preview (the full-resolution PNG is ~15 MB) for README / slides.
+    k = min(1.0, preview_width / crop.shape[1])
+    preview = cv2.resize(crop, None, fx=k, fy=k, interpolation=cv2.INTER_AREA)
+    cv2.imwrite(str(Path(out_path).with_name("route_preview.jpg")), preview,
+                [cv2.IMWRITE_JPEG_QUALITY, 85])
     return img
+
+
+def draw_verification(map_bgr, frame_files, results, out_path, n_show=4, tile=384):
+    """Sanity-check image: each row pair = UAV frame (left) and the map warped into
+    the frame's view with the found homography (right). If the localisation is right,
+    buildings, roads and bridges coincide."""
+    ok = [i for i, r in enumerate(results) if r is not None]
+    if not ok:
+        return None
+    picks = sorted(set(ok[int(round(k))] for k in np.linspace(0, len(ok) - 1, min(n_show, len(ok)))))
+    tiles = []
+    for i in picks:
+        frame = cv2.imread(str(frame_files[i]))
+        r = results[i]
+        h, w = frame.shape[:2]
+        # H maps the *resized* frame to the map; add the resize to map the full frame.
+        H_full = r.H @ np.diag([r.scale, r.scale, 1.0])
+        warped = cv2.warpPerspective(map_bgr, np.linalg.inv(H_full), (w, h),
+                                     flags=cv2.INTER_LINEAR)
+        a = cv2.resize(frame, (tile, tile), interpolation=cv2.INTER_AREA)
+        b = cv2.resize(warped, (tile, tile), interpolation=cv2.INTER_LINEAR)
+        for img, text in ((a, f"frame {i}"), (b, "map")):
+            cv2.putText(img, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 4, cv2.LINE_AA)
+            cv2.putText(img, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2, cv2.LINE_AA)
+        tiles.append(np.hstack([a, b]))
+    while len(tiles) % 2:
+        tiles.append(np.zeros_like(tiles[0]))
+    rows = [np.hstack(tiles[k:k + 2]) for k in range(0, len(tiles), 2)]
+    grid = np.vstack(rows)
+    cv2.imwrite(str(out_path), grid)
+    return grid
 
 
 def make_video(map_bgr, path, boxes, out_path, fps=4, margin=250, repeat=6):

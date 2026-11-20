@@ -1,5 +1,5 @@
+"""Step-by-step prototype for one frame (kept for reference; main.py is the real pipeline)."""
 import numpy as np
-import matplotlib 
 import cv2
 
 globalmap = cv2.imread("data/global_map.png")
