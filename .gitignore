@@ -1,0 +1,13 @@
+# virtual environment and Python caches
+.venv/
+__pycache__/
+*.pyc
+
+# task input data (download it from the task link and put it into data/)
+data/
+
+# heavy / regenerable outputs
+results/map_features.npz
+results/mapres.png
+results/result1.png
+results/route.mp4
