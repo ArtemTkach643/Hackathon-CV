@@ -22,6 +22,7 @@ import numpy as np
 SCALE = 0.5        # shrink photos before SIFT: they are zoomed in ~4x compared to the map
 RATIO = 0.75       # ratio test: a match is kept only if it is clearly better than the 2nd best
 MIN_INLIERS = 15   # fewer RANSAC "agreeing" matches than this -> we do not trust the result
+MAX_JUMP = 4       # a point this many "typical steps" away from its neighbours is a wrong match
 
 
 def find_features(gray, sift):
@@ -58,7 +59,37 @@ def find_on_map(photo_gray, sift, matcher, map_points):
     corners = np.float32([[0, 0], [w, 0], [w, h], [0, h]]).reshape(-1, 1, 2)
     corners_on_map = cv2.perspectiveTransform(corners, H).reshape(-1, 2)
     centre = cv2.perspectiveTransform(np.float32([[[w / 2, h / 2]]]), H)[0, 0]
+    # A real photo stays a convex quadrilateral on the map; a twisted one means a broken H.
+    if not cv2.isContourConvex(np.int32(np.round(corners_on_map)).reshape(-1, 1, 2)):
+        return None
     return centre, corners_on_map, int(mask.sum())
+
+
+def drop_jumps(centres, boxes):
+    """Remove photos that were matched to a wrong place of the map.
+
+    Such a match can be very confident (hundreds of inliers), but the drone cannot jump:
+    compare every point with the median of its 4+4 found neighbours and drop it if it is
+    farther than MAX_JUMP steps of the drone there (median step between those neighbours).
+    Medians ignore a few bad neighbours, so even several wrong photos in a row are caught.
+    The limit is never smaller than one photo, so a hovering drone is not "jumping".
+    Returns the indices of the dropped photos.
+    """
+    found = [i for i, c in enumerate(centres) if c is not None]
+    if len(found) < 5:
+        return []
+    pts = np.array([centres[i] for i in found])
+    photo_size = np.median([np.linalg.norm(boxes[i][1] - boxes[i][0]) for i in found])
+    dropped = []
+    for k, i in enumerate(found):
+        lo = max(0, k - 4)
+        neighbours = np.delete(pts[lo:k + 5], k - lo, axis=0)
+        step = np.median(np.linalg.norm(np.diff(neighbours, axis=0), axis=1))
+        if np.linalg.norm(pts[k] - np.median(neighbours, axis=0)) > max(MAX_JUMP * step, photo_size):
+            dropped.append(i)
+    for i in dropped:
+        centres[i] = None
+    return dropped
 
 
 def fill_gaps(centres):
@@ -146,8 +177,12 @@ def main():
             centres.append(centre)
             boxes.append(corners)
 
+    for i in drop_jumps(centres, boxes):
+        print(f"[{i:2d}] {files[i].name}: dropped - jumps away from the route (wrong place)")
+        boxes[i] = None
+
     found_count = sum(c is not None for c in centres)
-    print(f"Found {found_count} of {len(files)} photos")
+    print(f"Found {found_count} of {len(files)} photos (the rest are interpolated)")
     if found_count < 2:
         raise SystemExit("Too few photos were found to build a route")
 
