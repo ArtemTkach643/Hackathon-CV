@@ -48,10 +48,10 @@ more than 22 px (10 % of a photo) from the truth.
 
 | version | bad points (9 flights, 450 points) | where it fails | median error | time / flight |
 |---------|-----------------------------------|----------------|--------------|---------------|
-| `main` (modular) | 20 | wrong places in a row (5), hovering (14), 1* | 0.35 px | ~10 s |
+| `complex-version` (modular, first version) | 20 | wrong places in a row (5), hovering (14), 1* | 0.35 px | ~10 s |
 | `simplify` (PR #2) | 11 | any wrong place (2 + 5), every-2nd-lost (4) | 0.35 px | ~10 s |
-| `benchmark-and-pitch` (PR #1) | 20 | same as `main` | 0.35 px | ~10 s |
-| **`simple-robust` (this)** | **1*** | - | 0.35 px | ~10 s |
+| `benchmark-and-pitch` (PR #1) | 20 | same as `complex-version` | 0.35 px | ~10 s |
+| **`main` (= `simple-robust`, this)** | **1*** | - | 0.35 px | ~10 s |
 
 \* the last photo of the "every 2nd unusable" flight is noise, so every version ends the route
 at the previous photo (one step, 65 px) - nothing to fix there.
@@ -98,16 +98,18 @@ and `trajectory.csv` (route points in map pixels). The run takes about 12 second
 
 ## Other versions of the code (git branches)
 
-This version is the simple one-file solution plus the one step that measurably matters
+`main` is the simple one-file solution plus the one step that measurably matters
 (dropping wrong places). The other versions are kept in branches:
 
-* `main` - the first version split into modules (`localizer.py`, `trajectory.py`,
+* `complex-version` - the first version, split into modules (`localizer.py`, `trajectory.py`,
   `visualize.py`) with a map-features cache, outlier rejection, smoothing and a route video.
 * `benchmark-and-pitch` (pull request #1) - on top of that: accuracy benchmark on synthetic
   frames with known ground truth (`benchmark.py`), multi-scale fallback, per-frame CSV report,
   `--verify`. **The single-photo numbers in `pitch/`** ("0 wrong answers in 540 tests") come from
   its `benchmark.py`; the localisation core is the same in all versions.
-* `simplify` (pull request #2) - the one-file version without any check of wrong places.
+* `simplify` (pull request #2, merged) - the one-file version without any check of wrong places.
+* `simple-robust` (pull request #3, merged) - `simplify` plus the wrong-place check; this is
+  what `main` contains now.
 
 ## Limitations
 
